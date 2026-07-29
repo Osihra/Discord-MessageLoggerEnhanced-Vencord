@@ -70,6 +70,7 @@ let toolbarButton: HTMLButtonElement | undefined;
 let logDialog: HTMLDialogElement | undefined;
 let dialogSearch = "";
 let dialogSort: "newest" | "oldest" = "newest";
+let dialogContentFilter: "all" | "text" | "images" | "gifs" = "all";
 let dialogPage = 1;
 const DIALOG_PAGE_SIZE = 20;
 const retainedDeletedElements = new Map<string, HTMLElement>();
@@ -442,9 +443,54 @@ function clearDeletedLogs() {
     renderLogDialog();
 }
 
+
+function isGifAttachment(attachment: StoredAttachment): boolean {
+    const contentType = String(attachment.contentType ?? "").toLowerCase();
+    const filename = String(attachment.filename ?? "").toLowerCase();
+    const url = String(attachment.url ?? attachment.proxyUrl ?? "").toLowerCase();
+
+    return contentType === "image/gif"
+        || filename.endsWith(".gif")
+        || url.includes(".gif")
+        || url.includes("tenor.com")
+        || url.includes("giphy.com");
+}
+
+function isImageAttachment(attachment: StoredAttachment): boolean {
+    const contentType = String(attachment.contentType ?? "").toLowerCase();
+    const filename = String(attachment.filename ?? "").toLowerCase();
+
+    return contentType.startsWith("image/")
+        || /\.(png|jpe?g|webp|bmp|avif)$/i.test(filename);
+}
+
+function matchesContentFilter(log: PersistentLog): boolean {
+    if (dialogContentFilter === "all")
+        return true;
+
+    const hasGif = log.attachments.some(isGifAttachment)
+        || /(?:tenor\.com|giphy\.com|\.gif(?:\?|$))/i.test(log.content);
+
+    const hasImage = log.attachments.some(attachment =>
+        isImageAttachment(attachment) && !isGifAttachment(attachment)
+    );
+
+    if (dialogContentFilter === "gifs")
+        return hasGif;
+
+    if (dialogContentFilter === "images")
+        return hasImage;
+
+    // "Text messages" means entries with actual text that are not image/GIF-only posts.
+    return Boolean(log.content.trim()) && !hasGif && !hasImage;
+}
+
 function getVisibleDeletedLogs() {
     const query = dialogSearch.trim().toLowerCase();
-    const entries = logs.filter(log => log.type === "deleted").filter(log => {
+    const entries = logs
+        .filter(log => log.type === "deleted")
+        .filter(matchesContentFilter)
+        .filter(log => {
         if (!query) return true;
         const channel = channelLabel(log.channelId);
         return [
@@ -672,6 +718,7 @@ function openLogDialog() {
     closeLogDialog();
     dialogSearch = "";
     dialogSort = "newest";
+    dialogContentFilter = "all";
     dialogPage = 1;
 
     const dialog = document.createElement("dialog");
@@ -807,8 +854,14 @@ function openLogDialog() {
         }
         .mle-search::placeholder { color:#b9c1cf !important; opacity:1; }
         .mle-search-icon { width:23px; height:23px; color:#d7dce5 !important; flex:0 0 auto; }
-        .mle-sort {
-            min-width:220px;
+        .mle-filter-controls {
+            display:flex;
+            align-items:center;
+            gap:12px;
+        }
+        .mle-sort,
+        .mle-content-filter {
+            min-width:190px;
             height:50px;
             padding:0 16px;
             border:1px solid rgba(255,255,255,.16);
@@ -939,6 +992,8 @@ function openLogDialog() {
             .mle-tracking-mode,.mle-current-server-toggle { width:100%; }
             .mle-controls { align-items:stretch; flex-direction:column; padding:16px 20px; }
             .mle-search-wrap { width:auto; }
+            .mle-filter-controls { align-items:stretch; flex-direction:column; }
+            .mle-sort,.mle-content-filter { width:100%; }
             .mle-list { padding:0 20px 20px; }
             .mle-entry { grid-template-columns:44px minmax(0,1fr); }
             .mle-avatar { width:44px; height:44px; }
@@ -982,10 +1037,18 @@ function openLogDialog() {
                 <svg class="mle-search-icon" viewBox="0 0 24 24"><path fill="currentColor" d="m20.7 19.3-4.2-4.2a7 7 0 1 0-1.4 1.4l4.2 4.2 1.4-1.4ZM5 11a6 6 0 1 1 12 0 6 6 0 0 1-12 0Z"/></svg>
                 <input class="mle-search" type="search" placeholder="Search messages..." autocomplete="off">
             </label>
-            <select class="mle-sort" aria-label="Sort deleted messages">
-                <option value="newest">Newest First</option>
-                <option value="oldest">Oldest First</option>
-            </select>
+            <div class="mle-filter-controls">
+                <select class="mle-content-filter" aria-label="Filter deleted content">
+                    <option value="all">All deleted content</option>
+                    <option value="text">Text messages only</option>
+                    <option value="images">Images only</option>
+                    <option value="gifs">GIFs only</option>
+                </select>
+                <select class="mle-sort" aria-label="Sort deleted messages">
+                    <option value="newest">Newest First</option>
+                    <option value="oldest">Oldest First</option>
+                </select>
+            </div>
         </section>
         <main class="mle-list"></main>
         <footer class="mle-footer">
@@ -1056,6 +1119,16 @@ function openLogDialog() {
     const search = dialog.querySelector<HTMLInputElement>(".mle-search");
     search?.addEventListener("input", () => {
         dialogSearch = search.value;
+        dialogPage = 1;
+        renderLogDialog();
+    });
+
+    const contentFilter = dialog.querySelector<HTMLSelectElement>(".mle-content-filter");
+    contentFilter?.addEventListener("change", () => {
+        const value = contentFilter.value;
+        dialogContentFilter = value === "text" || value === "images" || value === "gifs"
+            ? value
+            : "all";
         dialogPage = 1;
         renderLogDialog();
     });
@@ -1165,9 +1238,10 @@ function removeRetainedMessage(channelId: string, messageId: string) {
 }
 
 function buildRetainedDeletedMessage(message: CachedMessage): HTMLElement {
-    const element = document.createElement("div");
+    const element = document.createElement("li");
     element.id = retainedElementId(message.channelId, message.messageId);
     element.className = "mle-retained-deleted-message";
+    element.setAttribute("role", "listitem");
     element.dataset.channelId = message.channelId;
     element.dataset.messageId = message.messageId;
 
@@ -1205,6 +1279,60 @@ function buildRetainedDeletedMessage(message: CachedMessage): HTMLElement {
     return element;
 }
 
+function extractMessageIdFromElement(element: Element): string | undefined {
+    const id = element.id || element.getAttribute("data-list-item-id") || "";
+    const match = id.match(/(\d{15,25})(?!.*\d)/);
+    return match?.[1];
+}
+
+function findMessageContainer(element: Element | null | undefined): Element | null {
+    if (!element) return null;
+
+    return element.closest(
+        'li[id^="chat-messages-"], li[data-list-item-id*="chat-messages"], [id^="chat-messages-"]'
+    ) ?? element;
+}
+
+function insertRetainedChronologically(retained: HTMLElement, message: CachedMessage): boolean {
+    const messageList = document.querySelector<HTMLElement>('[data-list-id="chat-messages"]');
+    if (!messageList)
+        return false;
+
+    const candidates = Array.from(messageList.querySelectorAll<HTMLElement>(
+        ':scope > li[id^="chat-messages-"], :scope > li[data-list-item-id*="chat-messages"], :scope > [id^="chat-messages-"]'
+    ));
+
+    if (!candidates.length)
+        return false;
+
+    let deletedId: bigint;
+    try {
+        deletedId = BigInt(message.messageId);
+    } catch {
+        return false;
+    }
+
+    for (const candidate of candidates) {
+        const candidateIdText = extractMessageIdFromElement(candidate);
+        if (!candidateIdText) continue;
+
+        try {
+            if (BigInt(candidateIdText) > deletedId) {
+                messageList.insertBefore(retained, candidate);
+                return true;
+            }
+        } catch { }
+    }
+
+    // Only append after the final real message element—not to an empty list or composer area.
+    const lastRealMessage = candidates.at(-1);
+    if (!lastRealMessage?.parentElement)
+        return false;
+
+    lastRealMessage.insertAdjacentElement("afterend", retained);
+    return true;
+}
+
 function retainDeletedMessageInChat(message: CachedMessage, originalElement?: Element | null) {
     if (!settings.store.keepDeletedMessagesInChat)
         return;
@@ -1212,43 +1340,50 @@ function retainDeletedMessageInChat(message: CachedMessage, originalElement?: El
     if (!shouldTrackLocation(message.channelId, message.guildId))
         return;
 
+    // Never inject a deleted message into a different open channel.
+    if (SelectedChannelStore.getChannelId() !== message.channelId)
+        return;
+
     removeRetainedMessage(message.channelId, message.messageId);
 
     const retained = buildRetainedDeletedMessage(message);
     const key = cacheKey(message.channelId, message.messageId);
-    const originalParent = originalElement?.parentElement ?? null;
-    const originalNextSibling = originalElement?.nextSibling ?? null;
+    const originalContainer = findMessageContainer(originalElement);
+    const originalParent = originalContainer?.parentElement ?? null;
+    const originalNextSibling = originalContainer?.nextSibling ?? null;
+    let inserted = false;
 
     const insert = () => {
-        if (document.getElementById(retained.id))
+        if (inserted || document.getElementById(retained.id))
             return;
 
-        // Never inject a deleted message into a different open channel.
         if (SelectedChannelStore.getChannelId() !== message.channelId)
             return;
 
+        // Preferred path: preserve the exact original position captured before Discord removes it.
         if (originalParent?.isConnected) {
             if (originalNextSibling && originalNextSibling.parentNode === originalParent)
                 originalParent.insertBefore(retained, originalNextSibling);
+            else if (originalContainer?.isConnected)
+                originalContainer.insertAdjacentElement("afterend", retained);
             else
-                originalParent.appendChild(retained);
-        } else {
-            const messageList = document.querySelector<HTMLElement>('[data-list-id="chat-messages"]');
-            if (!messageList)
-                return;
+                return; // Do not append blindly when the exact anchor disappeared.
 
-            // The fallback is permitted only after confirming the selected channel.
-            messageList.appendChild(retained);
+            inserted = true;
+        } else {
+            // Reopening/jumping to an old log: place it by Discord snowflake order.
+            inserted = insertRetainedChronologically(retained, message);
         }
 
-        retainedDeletedElements.set(key, retained);
+        if (inserted)
+            retainedDeletedElements.set(key, retained);
     };
 
-    // Discord removes the normal message after the delete dispatch. Reinsert after React settles.
-    setTimeout(insert, 30);
-    setTimeout(insert, 250);
+    // Discord removes the original React element shortly after the delete dispatch.
+    setTimeout(insert, 35);
+    setTimeout(insert, 180);
+    setTimeout(insert, 450);
 }
-
 function addGlobalChatStyles() {
     if (document.getElementById("mle-global-styles"))
         return;

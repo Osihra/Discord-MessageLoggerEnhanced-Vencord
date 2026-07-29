@@ -1,13 +1,31 @@
-# MessageLoggerEnhanced v3.3
+# MessageLoggerEnhanced v3.4
 
-## Changes
+## Fixes
 
-- Tracking mode is now directly inside the main MessageLoggerEnhanced panel.
-- Choose Private Messages only, Servers only, or Private Messages and Servers without opening Vencord settings.
-- The panel has a button to stop/start tracking the server currently open in Discord.
-- Closing the panel now force-cleans the native dialog/modal state and returns keyboard focus to the Discord message box.
-- Existing per-server right-click controls and Vencord settings remain available.
+- Deleted messages no longer get placed above the message composer.
+- The plugin first preserves the exact original DOM position.
+- When jumping to an older deleted message, it inserts the entry chronologically between loaded Discord messages using message snowflake IDs.
+- It never appends into an empty chat list or blindly attaches near the composer.
 
-## Install
+## Panel content filters
 
-Replace your current folder with `MessageLoggerEnhanced`, run `pnpm build`, and restart Discord.
+The main log panel now includes:
+
+- All deleted content
+- Text messages only
+- Images only
+- GIFs only
+
+These filters work together with search, sorting and pagination.
+
+## Installation
+
+Replace your existing folder with:
+
+`Vencord/src/userplugins/MessageLoggerEnhanced/`
+
+Then run:
+
+`pnpm build`
+
+Restart Discord afterward.
