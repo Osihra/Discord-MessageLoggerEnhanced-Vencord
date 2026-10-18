@@ -43,6 +43,8 @@ interface PersistentLog {
     attachments: StoredAttachment[];
     messageTimestamp?: string;
     loggedAt: string;
+    bookmarked?: boolean;
+    ghostPing?: boolean;
 }
 
 interface CachedMessage {
@@ -59,9 +61,25 @@ interface CachedMessage {
 
 const STORE_KEY = "MessageLoggerEnhanced_logs_v1";
 const CACHE_KEY = "MessageLoggerEnhanced_message_cache_v1";
+const READ_KEY = "MessageLoggerEnhanced_last_viewed_v1";
+const EXTRA_KEY = "MessageLoggerEnhanced_extra_v1";
 const LEGACY_STORE_KEY = "PersistentMessageLogger_logs_v1";
 const LEGACY_CACHE_KEY = "PersistentMessageLogger_message_cache_v1";
 let logs: PersistentLog[] = [];
+let paused = false;
+let ignoredUsers = "";
+let mediaCacheEnabled = false;
+let mediaLimitMb = 100;
+let filterAuthor = "";
+let filterChannel = "";
+let filterSince = "";
+let filterUntil = "";
+let bookmarksOnly = false;
+let ghostsOnly = false;
+let mediaUsedBytes = 0;
+let mediaDbPromise: Promise<IDBDatabase> | undefined;
+const mediaPending = new Set<string>();
+let lastViewedAt = 0;
 let messageCache: Record<string, CachedMessage> = {};
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
 let cacheSaveTimer: ReturnType<typeof setTimeout> | undefined;
@@ -70,6 +88,7 @@ let toolbarButton: HTMLButtonElement | undefined;
 let logDialog: HTMLDialogElement | undefined;
 let dialogSearch = "";
 let dialogSort: "newest" | "oldest" = "newest";
+let dialogLogType: "all" | "deleted" | "edited" = "all";
 let dialogContentFilter: "all" | "text" | "images" | "gifs" = "all";
 let dialogPage = 1;
 const DIALOG_PAGE_SIZE = 20;
@@ -93,6 +112,151 @@ function normaliseAuthor(author: any): StoredAuthor {
         avatar: author?.avatar ?? null,
         bot: Boolean(author?.bot)
     };
+}
+
+function ignoredUserSet(): Set<string> {
+    return new Set(ignoredUsers.split(/[\s,]+/).filter(Boolean));
+}
+
+function ignoredAuthor(user: { id: string }): boolean {
+    return ignoredUserSet().has(String(user.id));
+}
+
+function saveExtraState() {
+    void DataStore.set(EXTRA_KEY, { paused, ignoredUsers, mediaCacheEnabled, mediaLimitMb });
+}
+
+function updatePanelState() {
+    if (!logDialog?.isConnected) return;
+    const pause = logDialog.querySelector<HTMLButtonElement>(".mle-pause");
+    if (pause) pause.textContent = paused ? "Resume logging" : "Pause logging";
+    const storage = logDialog.querySelector<HTMLElement>(".mle-storage-info");
+    if (storage) storage.textContent = `Logs: ${logs.length} · Cache: ${Object.keys(messageCache).length} · Media: ${(mediaUsedBytes / 1048576).toFixed(1)} MB / ${mediaLimitMb} MB`;
+}
+
+function openMediaDb(): Promise<IDBDatabase> {
+    if (mediaDbPromise) return mediaDbPromise;
+    return mediaDbPromise = new Promise((resolve, reject) => {
+        const request = indexedDB.open("MessageLoggerEnhancedMedia", 1);
+        request.onupgradeneeded = () => request.result.createObjectStore("media", { keyPath: "url" });
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function listMedia(): Promise<Array<{url: string; data: Blob; savedAt: number; size: number}>> {
+    const db = await openMediaDb();
+    return new Promise((resolve, reject) => {
+        const request = db.transaction("media", "readonly").objectStore("media").getAll();
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function refreshMediaSize() {
+    try {
+        mediaUsedBytes = (await listMedia()).reduce((sum, item) => sum + item.size, 0);
+        updatePanelState();
+    } catch (error) { console.warn("MessageLoggerEnhanced media database error", error); }
+}
+
+async function pruneMedia() {
+    const entries = (await listMedia()).sort((a, b) => a.savedAt - b.savedAt);
+    let total = entries.reduce((sum, item) => sum + item.size, 0);
+    const limit = Math.max(1, mediaLimitMb) * 1048576;
+    if (total <= limit) { mediaUsedBytes = total; updatePanelState(); return; }
+    const db = await openMediaDb();
+    for (const entry of entries) {
+        if (total <= limit) break;
+        await new Promise<void>((resolve, reject) => {
+            const r = db.transaction("media", "readwrite").objectStore("media").delete(entry.url);
+            r.onsuccess = () => resolve(); r.onerror = () => reject(r.error);
+        });
+        total -= entry.size;
+    }
+    mediaUsedBytes = total;
+    updatePanelState();
+}
+
+async function cacheMedia(attachments: StoredAttachment[]) {
+    if (!mediaCacheEnabled || paused) return;
+    for (const attachment of attachments) {
+        const url = attachment.url;
+        if (!url || mediaPending.has(url) || !(/\.(?:png|jpe?g|webp|gif)(?:\?|$)/i.test(url) || /^image\//.test(attachment.contentType ?? ""))) continue;
+        mediaPending.add(url);
+        try {
+            const response = await fetch(url);
+            if (!response.ok) continue;
+            const data = await response.blob();
+            if (data.size > 20 * 1048576 || !data.type.startsWith("image/")) continue;
+            const db = await openMediaDb();
+            await new Promise<void>((resolve, reject) => {
+                const request = db.transaction("media", "readwrite").objectStore("media").put({ url, data, size: data.size, savedAt: Date.now() });
+                request.onsuccess = () => resolve(); request.onerror = () => reject(request.error);
+            });
+            await pruneMedia();
+        } catch (error) { console.debug("MessageLoggerEnhanced: media caching failed", error); }
+        finally { mediaPending.delete(url); }
+    }
+}
+
+async function openCachedMedia(url: string) {
+    const db = await openMediaDb();
+    const item = await new Promise<{data: Blob} | undefined>((resolve, reject) => {
+        const request = db.transaction("media", "readonly").objectStore("media").get(url);
+        request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error);
+    });
+    if (!item) { alert("This attachment was not cached locally. Its Discord URL may have expired."); return; }
+    const blobUrl = URL.createObjectURL(item.data);
+    const a = document.createElement("a"); a.href = blobUrl; a.target = "_blank"; a.rel = "noreferrer";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+}
+
+function makeBackup() {
+    const blob = new Blob([JSON.stringify({ format: "MessageLoggerEnhancedBackup", version: 1, logs, messageCache, options: { paused, ignoredUsers, mediaCacheEnabled, mediaLimitMb } }, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href = url; a.download = `MessageLoggerEnhanced-backup-${new Date().toISOString().slice(0,10)}.json`;
+    document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 3000);
+}
+
+async function importBackup(file: File) {
+    if (file.size > 35 * 1048576) throw Error("Backup file too large (35MB limit)");
+    const parsed = JSON.parse(await file.text());
+    if (parsed?.format !== "MessageLoggerEnhancedBackup" || parsed.version !== 1 || !Array.isArray(parsed.logs)) throw Error("Not a valid MessageLoggerEnhanced backup");
+    const byKey = new Map<string, PersistentLog>(logs.map(log => [log.key, log]));
+    for (const log of parsed.logs) {
+        if (!log || typeof log.key !== "string" || typeof log.messageId !== "string" || typeof log.channelId !== "string" || !["edited", "deleted"].includes(log.type)) continue;
+        byKey.set(log.key, log);
+    }
+    logs = [...byKey.values()];
+    if (parsed.messageCache && typeof parsed.messageCache === "object" && !Array.isArray(parsed.messageCache)) {
+        for (const [key, item] of Object.entries(parsed.messageCache)) {
+            const candidate = item as CachedMessage;
+            if (candidate?.messageId && candidate?.channelId) messageCache[key] = candidate;
+        }
+    }
+    trimLogs(); trimMessageCache(); purgeUntrackedCache(); scheduleSave(); scheduleCacheSave(); updateToolbarBadge(); renderLogDialog();
+}
+
+function getEditTimeline(log: PersistentLog): string[] {
+    const edits = logs.filter(x => x.type === "edited" && x.channelId === log.channelId && x.messageId === log.messageId)
+        .sort((a,b) => Date.parse(a.loggedAt) - Date.parse(b.loggedAt));
+    if (!edits.length) return [];
+    return [String(edits[0].oldContent ?? ""), ...edits.map(x => String(x.newContent ?? x.content ?? ""))];
+}
+
+function showEditTimeline(log: PersistentLog) {
+    const timeline = getEditTimeline(log);
+    alert(timeline.map((version, index) => `Version ${index + 1}:\n${version || "(empty)"}`).join("\n\n──────────\n\n"));
+}
+
+function isGhostPing(message: CachedMessage): boolean {
+    const me = UserStore.getCurrentUser()?.id;
+    if (!me) return false;
+    return new RegExp(`<@!?${me}>`).test(message.content)
+        || message.content.includes("@everyone")
+        || message.content.includes("@here");
 }
 
 function cacheKey(channelId: string, messageId: string): string {
@@ -247,8 +411,9 @@ function rememberMessage(message: any): CachedMessage | undefined {
     const messageId = String(message?.id ?? "");
     if (!channelId || !messageId) return undefined;
 
+    if (message?.author?.id && ignoredAuthor({ id: String(message.author.id) })) return undefined;
     const channel: any = ChannelStore.getChannel(channelId);
-    if (!shouldTrackLocation(channelId, channel?.guild_id))
+    if (paused || !shouldTrackLocation(channelId, channel?.guild_id))
         return undefined;
 
     const key = cacheKey(channelId, messageId);
@@ -295,6 +460,7 @@ function addLog(entry: PersistentLog) {
     trimLogs();
     scheduleSave();
     updateToolbarBadge();
+    updatePanelState();
     if (logDialog?.open) renderLogDialog();
 }
 
@@ -367,6 +533,47 @@ function escapeHtml(value: unknown): string {
         .replaceAll("'", "&#039;");
 }
 
+function getHighlightTerms(): string[] {
+    const seen = new Set<string>();
+
+    return dialogSearch
+        .trim()
+        .split(/\s+/)
+        .map(term => term.trim())
+        .filter(term => {
+            const key = term.toLocaleLowerCase();
+            if (!term || seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        })
+        .sort((a, b) => b.length - a.length);
+}
+
+function escapeRegExp(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function highlightSearchText(value: unknown): string {
+    const text = String(value ?? "");
+    const terms = getHighlightTerms();
+    if (!terms.length)
+        return escapeHtml(text);
+
+    const expression = new RegExp(`(${terms.map(escapeRegExp).join("|")})`, "giu");
+    let output = "";
+    let lastIndex = 0;
+
+    for (const match of text.matchAll(expression)) {
+        const index = match.index ?? 0;
+        output += escapeHtml(text.slice(lastIndex, index));
+        output += `<mark class="mle-search-highlight">${escapeHtml(match[0])}</mark>`;
+        lastIndex = index + match[0].length;
+    }
+
+    output += escapeHtml(text.slice(lastIndex));
+    return output;
+}
+
 function avatarUrl(author: StoredAuthor): string {
     if (author.avatar)
         return `https://cdn.discordapp.com/avatars/${author.id}/${author.avatar}.png?size=128`;
@@ -398,8 +605,7 @@ function relativeTime(iso: string): string {
 }
 
 function downloadJsonFile(entries: PersistentLog[]) {
-    const deletedEntries = entries.filter(log => log.type === "deleted");
-    const blob = new Blob([JSON.stringify(deletedEntries, null, 2)], {
+    const blob = new Blob([JSON.stringify(entries, null, 2)], {
         type: "application/json;charset=utf-8"
     });
     const url = URL.createObjectURL(blob);
@@ -407,14 +613,14 @@ function downloadJsonFile(entries: PersistentLog[]) {
     const stamp = new Date().toISOString().replaceAll(":", "-").replaceAll(".", "-");
 
     anchor.href = url;
-    anchor.download = `MessageLoggerEnhanced-deleted-messages-${stamp}.json`;
+    anchor.download = `MessageLoggerEnhanced-logs-${stamp}.json`;
     document.body.appendChild(anchor);
     anchor.click();
     anchor.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1_000);
 
     Toasts.show({
-        message: `Downloaded ${deletedEntries.length} deleted-message log${deletedEntries.length === 1 ? "" : "s"}.`,
+        message: `Downloaded ${entries.length} message log${entries.length === 1 ? "" : "s"}.`,
         type: Toasts.Type.SUCCESS,
         id: Toasts.genId()
     });
@@ -437,6 +643,27 @@ function clearDeletedLogs() {
             removeRetainedMessage(log.channelId, log.messageId);
 
     logs = logs.filter(log => log.type !== "deleted");
+    scheduleSave();
+    updateToolbarBadge();
+    dialogPage = 1;
+    renderLogDialog();
+}
+
+function clearVisibleLogType() {
+    if (dialogLogType === "deleted") {
+        clearDeletedLogs();
+        return;
+    }
+
+    if (dialogLogType === "edited") {
+        logs = logs.filter(log => log.type !== "edited");
+    } else {
+        for (const log of logs)
+            if (log.type === "deleted")
+                removeRetainedMessage(log.channelId, log.messageId);
+        logs = [];
+    }
+
     scheduleSave();
     updateToolbarBadge();
     dialogPage = 1;
@@ -485,25 +712,73 @@ function matchesContentFilter(log: PersistentLog): boolean {
     return Boolean(log.content.trim()) && !hasGif && !hasImage;
 }
 
-function getVisibleDeletedLogs() {
-    const query = dialogSearch.trim().toLowerCase();
+function normalizeSearchValue(value: unknown): string {
+    return String(value ?? "")
+        .normalize("NFKD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .toLocaleLowerCase()
+        .replace(/[^\p{L}\p{N}@#._:/-]+/gu, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function getSearchHaystack(log: PersistentLog): string {
+    const channel: any = ChannelStore.getChannel(log.channelId);
+    const channelName = channel?.name ? `#${channel.name}` : "";
+    const serverId = log.guildId ?? channel?.guild_id ?? "";
+    const date = new Date(log.loggedAt);
+
+    return normalizeSearchValue([
+        log.type,
+        log.type === "deleted" ? "deleted" : "edited",
+        log.author.globalName,
+        log.author.username,
+        `@${log.author.username}`,
+        log.author.id,
+        log.content,
+        log.oldContent,
+        log.newContent,
+        log.channelId,
+        channelName,
+        channelLabel(log.channelId),
+        serverId,
+        log.messageId,
+        log.loggedAt,
+        Number.isNaN(date.getTime()) ? "" : date.toLocaleString(),
+        Number.isNaN(date.getTime()) ? "" : date.toLocaleDateString(),
+        ...log.attachments.flatMap(attachment => [
+            attachment.filename,
+            attachment.contentType,
+            attachment.url,
+            attachment.proxyUrl
+        ])
+    ].join(" "));
+}
+
+function matchesSearch(log: PersistentLog, rawQuery: string): boolean {
+    const normalizedQuery = normalizeSearchValue(rawQuery);
+    if (!normalizedQuery)
+        return true;
+
+    const tokens = normalizedQuery.split(" ").filter(Boolean);
+    const haystack = getSearchHaystack(log);
+
+    // Every entered word must be present, but the words can appear in any order
+    // and across different fields (for example: "starlight edited general").
+    return tokens.every(token => haystack.includes(token));
+}
+
+function getVisibleLogs() {
     const entries = logs
-        .filter(log => log.type === "deleted")
+        .filter(log => !bookmarksOnly || log.bookmarked)
+        .filter(log => !ghostsOnly || log.ghostPing)
+        .filter(log => !filterAuthor || [log.author.username, log.author.globalName, log.author.id].some(v => String(v ?? "").toLowerCase().includes(filterAuthor.toLowerCase())))
+        .filter(log => !filterChannel || [log.channelId, channelLabel(log.channelId), log.guildId].some(v => String(v ?? "").toLowerCase().includes(filterChannel.toLowerCase())))
+        .filter(log => !filterSince || Date.parse(log.loggedAt) >= new Date(filterSince).getTime())
+        .filter(log => !filterUntil || Date.parse(log.loggedAt) < new Date(filterUntil).getTime() + 86400000)
+        .filter(log => dialogLogType === "all" || log.type === dialogLogType)
         .filter(matchesContentFilter)
-        .filter(log => {
-        if (!query) return true;
-        const channel = channelLabel(log.channelId);
-        return [
-            log.author.globalName,
-            log.author.username,
-            log.author.id,
-            log.content,
-            log.channelId,
-            channel,
-            log.messageId,
-            ...log.attachments.map(attachment => attachment.filename)
-        ].some(value => String(value ?? "").toLowerCase().includes(query));
-    });
+        .filter(log => matchesSearch(log, dialogSearch));
 
     return entries.sort((a, b) => {
         const difference = Date.parse(a.loggedAt) - Date.parse(b.loggedAt);
@@ -574,7 +849,7 @@ function jumpToLoggedMessage(log: PersistentLog) {
 function renderLogDialog() {
     if (!logDialog?.isConnected) return;
 
-    const entries = getVisibleDeletedLogs();
+    const entries = getVisibleLogs();
     const totalPages = Math.max(1, Math.ceil(entries.length / DIALOG_PAGE_SIZE));
     dialogPage = Math.min(Math.max(1, dialogPage), totalPages);
 
@@ -592,11 +867,14 @@ function renderLogDialog() {
     const download = logDialog.querySelector<HTMLButtonElement>(".mle-download");
     const clear = logDialog.querySelector<HTMLButtonElement>(".mle-clear");
 
-    const allDeletedCount = logs.filter(log => log.type === "deleted").length;
+    const allCount = logs.length;
+    const deletedCount = logs.filter(log => log.type === "deleted").length;
+    const editedCount = logs.filter(log => log.type === "edited").length;
+    const activeLabel = dialogLogType === "deleted" ? "deleted" : dialogLogType === "edited" ? "edited" : "message";
     if (count)
-        count.textContent = `${allDeletedCount} deleted message${allDeletedCount === 1 ? "" : "s"}`;
+        count.textContent = `${deletedCount} deleted • ${editedCount} edited`;
     if (footerText)
-        footerText.textContent = `Displaying ${firstShown} – ${lastShown} of ${entries.length} deleted messages`;
+        footerText.textContent = `Displaying ${firstShown} – ${lastShown} of ${entries.length} ${activeLabel} logs`;
     if (pageButton)
         pageButton.textContent = String(dialogPage);
     if (previous)
@@ -604,40 +882,45 @@ function renderLogDialog() {
     if (next)
         next.disabled = dialogPage >= totalPages;
     if (download)
-        download.disabled = allDeletedCount === 0;
+        download.disabled = entries.length === 0;
     if (clear)
-        clear.disabled = allDeletedCount === 0;
+        clear.disabled = allCount === 0;
     if (!list) return;
 
     if (!pageEntries.length) {
-        list.innerHTML = `<div class="mle-empty">${dialogSearch ? "No deleted messages match your search." : "No deleted messages have been logged yet."}</div>`;
+        list.innerHTML = `<div class="mle-empty">${dialogSearch ? "No logs match your search and selected filters." : "No deleted or edited messages have been logged yet."}</div>`;
         return;
     }
 
+    updatePanelState();
     list.innerHTML = pageEntries.map(log => {
-        const displayName = escapeHtml(log.author.globalName || log.author.username);
-        const username = escapeHtml(log.author.username);
-        const content = escapeHtml(log.content || "(no text content)");
-        const channel = escapeHtml(channelLabel(log.channelId));
-        const fullTime = escapeHtml(new Date(log.loggedAt).toLocaleString());
-        const relative = escapeHtml(relativeTime(log.loggedAt));
+        const displayName = highlightSearchText(log.author.globalName || log.author.username);
+        const username = highlightSearchText(log.author.username);
+        const content = highlightSearchText(log.content || "(no text content)");
+        const oldContent = highlightSearchText(log.oldContent ?? "");
+        const newContent = highlightSearchText(log.newContent ?? log.content ?? "");
+        const isEdited = log.type === "edited";
+        const statusLabel = isEdited ? "Edited" : "Deleted";
+        const channel = highlightSearchText(channelLabel(log.channelId));
+        const fullTime = highlightSearchText(new Date(log.loggedAt).toLocaleString());
+        const relative = highlightSearchText(relativeTime(log.loggedAt));
         const avatar = escapeHtml(avatarUrl(log.author));
 
         const attachmentBlock = log.attachments.length
             ? `<div class="mle-attachments">${log.attachments.map(attachment => {
                 const href = escapeHtml(attachment.url ?? attachment.proxyUrl ?? "");
-                const filename = escapeHtml(attachment.filename);
+                const filename = highlightSearchText(attachment.filename);
                 const isImage = String(attachment.contentType ?? "").startsWith("image/");
                 return href
                     ? `<a class="mle-attachment" href="${href}" target="_blank" rel="noreferrer">
                         ${isImage ? `<img src="${href}" alt="">` : `<span class="mle-file-icon">▧</span>`}
                         <span>${filename}</span>
-                    </a>`
+                    </a><button class="mle-cache-open mle-tool" data-media-url="${href}" title="View cached copy" type="button">Cached copy</button>`
                     : `<span class="mle-attachment"><span class="mle-file-icon">▧</span><span>${filename}</span></span>`;
             }).join("")}</div>`
             : "";
 
-        return `<article class="mle-entry" data-jump-key="${escapeHtml(log.key)}" title="Click to open this message in chat">
+        return `<article class="mle-entry ${log.bookmarked ? "mle-bookmarked" : ""} ${isEdited ? "mle-entry-edited" : ""} ${dialogSearch.trim() ? "mle-search-result" : ""}" data-jump-key="${escapeHtml(log.key)}" title="Click to open this message in chat">
             <img class="mle-avatar" src="${avatar}" alt="">
             <div class="mle-entry-body">
                 <div class="mle-entry-header">
@@ -647,20 +930,29 @@ function renderLogDialog() {
                     </div>
                     <span class="mle-relative">${relative}</span>
                 </div>
-                <div class="mle-message">${content}</div>
+                ${isEdited
+                    ? `<div class="mle-edit-history">
+                        <div class="mle-edit-version"><span>Before</span><div>${oldContent || "(empty message)"}</div></div>
+                        <div class="mle-edit-arrow">→</div>
+                        <div class="mle-edit-version mle-edit-after"><span>After</span><div>${newContent || "(empty message)"}</div></div>
+                    </div>`
+                    : `<div class="mle-message">${content}</div>`}
                 ${attachmentBlock}
+                ${isEdited ? `<button class="mle-timeline" data-timeline-key="${escapeHtml(log.key)}">View all ${getEditTimeline(log).length} versions</button>` : ""}
                 <div class="mle-meta-row">
                     <span class="mle-channel-pill">${channel}</span>
-                    <span class="mle-deleted-pill">Deleted</span>
+                    <span class="mle-deleted-pill ${isEdited ? "mle-edited-pill" : ""}">${highlightSearchText(statusLabel)}</span>
+                    ${log.ghostPing ? `<span class="mle-ghost-pill">Ghost ping</span>` : ""}
                 </div>
                 <div class="mle-id-line">
-                    Channel: ${escapeHtml(log.channelId)}
+                    Channel: ${highlightSearchText(log.channelId)}
                     <b>•</b>
-                    Message ID: ${escapeHtml(log.messageId)}
+                    Message ID: ${highlightSearchText(log.messageId)}
                     <b>•</b>
-                    Deleted: ${fullTime}
+                    ${statusLabel}: ${fullTime}
                 </div>
             </div>
+            <button class="mle-bookmark" data-bookmark-key="${escapeHtml(log.key)}" title="Toggle bookmark" aria-label="Toggle bookmark">${log.bookmarked ? "★" : "☆"}</button>
             <button class="mle-delete-one" data-delete-key="${escapeHtml(log.key)}" aria-label="Delete this log" title="Delete this log">
                 <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M9 3V2h6v1h5v2H4V3h5Zm-3 4h12l-1 14H7L6 7Zm3 2 .5 10h1L10 9H9Zm4 0v10h1V9h-1Z"/></svg>
             </button>
@@ -675,6 +967,20 @@ function renderLogDialog() {
         });
     });
 
+    list.querySelectorAll<HTMLButtonElement>(".mle-cache-open").forEach(button => button.addEventListener("click", event => {
+        event.preventDefault(); event.stopPropagation();
+        if (button.dataset.mediaUrl) void openCachedMedia(button.dataset.mediaUrl).catch(e => alert(String(e)));
+    }));
+    list.querySelectorAll<HTMLButtonElement>(".mle-bookmark").forEach(button => button.addEventListener("click", event => {
+        event.stopPropagation();
+        const log = logs.find(item => item.key === button.dataset.bookmarkKey);
+        if (log) { log.bookmarked = !log.bookmarked; scheduleSave(); renderLogDialog(); }
+    }));
+    list.querySelectorAll<HTMLButtonElement>(".mle-timeline").forEach(button => button.addEventListener("click", event => {
+        event.stopPropagation();
+        const log = logs.find(item => item.key === button.dataset.timelineKey);
+        if (log) showEditTimeline(log);
+    }));
     list.querySelectorAll<HTMLElement>(".mle-entry[data-jump-key]").forEach(entry => {
         entry.addEventListener("click", event => {
             if ((event.target as HTMLElement).closest("a,button,input,select")) return;
@@ -718,12 +1024,23 @@ function openLogDialog() {
     closeLogDialog();
     dialogSearch = "";
     dialogSort = "newest";
+    dialogLogType = "all";
     dialogContentFilter = "all";
     dialogPage = 1;
+    lastViewedAt = Date.now();
+    void DataStore.set(READ_KEY, lastViewedAt);
+    updateToolbarBadge();
 
     const dialog = document.createElement("dialog");
     dialog.className = "mle-dialog";
     dialog.innerHTML = `<style>
+        .mle-extra-tools,.mle-advanced-search { display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:10px 26px;color:#e5e7eb;background:#1c1e24;border-bottom:1px solid #42454d;font-size:12px; }
+        .mle-extra-tools label,.mle-advanced-search label { display:flex;gap:5px;align-items:center; }
+        .mle-extra-tools input,.mle-advanced-search input {background:#101115;border:1px solid #5b606a;color:white;border-radius:5px;padding:6px;}
+        .mle-tool,.mle-timeline {background:#4b55ad;color:white;border:0;border-radius:5px;padding:8px 10px;cursor:pointer;}
+        .mle-bookmark {position:absolute;top:72px;right:26px;background:none;border:0;color:#facc15;font-size:24px;cursor:pointer;}
+        .mle-bookmarked {box-shadow:inset 0 0 0 1px #facc15;}
+        .mle-ghost-pill {color:#fff;background:#a5357b;border-radius:4px;padding:4px 8px;}
         .mle-dialog {
             width:min(1168px,calc(100vw - 48px));
             height:min(830px,calc(100vh - 48px));
@@ -846,6 +1163,7 @@ function openLogDialog() {
         }
         .mle-search {
             width:100%;
+            min-width:0;
             border:0;
             outline:0;
             color:#f3f4f6 !important;
@@ -853,6 +1171,23 @@ function openLogDialog() {
             font-size:16px;
         }
         .mle-search::placeholder { color:#b9c1cf !important; opacity:1; }
+        .mle-search-clear {
+            width:28px;
+            height:28px;
+            flex:0 0 auto;
+            display:none;
+            place-items:center;
+            padding:0;
+            border:0;
+            border-radius:5px;
+            cursor:pointer;
+            color:#ffffff;
+            background:rgba(255,255,255,.10);
+            font-size:21px;
+            line-height:1;
+        }
+        .mle-search-clear:hover { background:rgba(255,255,255,.18); }
+        .mle-search-clear.mle-visible { display:grid; }
         .mle-search-icon { width:23px; height:23px; color:#d7dce5 !important; flex:0 0 auto; }
         .mle-filter-controls {
             display:flex;
@@ -860,7 +1195,8 @@ function openLogDialog() {
             gap:12px;
         }
         .mle-sort,
-        .mle-content-filter {
+        .mle-content-filter,
+        .mle-log-type {
             min-width:190px;
             height:50px;
             padding:0 16px;
@@ -892,6 +1228,19 @@ function openLogDialog() {
             border:1px solid rgba(255,255,255,.16);
             border-radius:9px;
             background:#24262b;
+        }
+        .mle-entry.mle-search-result {
+            border-color:rgba(250,204,21,.72);
+            box-shadow:0 0 0 1px rgba(250,204,21,.18),0 7px 22px rgba(0,0,0,.28);
+        }
+        .mle-search-highlight {
+            padding:1px 3px;
+            border-radius:3px;
+            color:#17120a;
+            background:#facc15;
+            box-shadow:0 0 0 1px rgba(255,255,255,.18),0 0 10px rgba(250,204,21,.30);
+            font:inherit;
+            font-weight:800;
         }
         .mle-avatar { width:56px; height:56px; border-radius:50%; object-fit:cover; }
         .mle-entry:hover {
@@ -958,6 +1307,14 @@ function openLogDialog() {
             background:transparent;
         }
         .mle-delete-one:hover { color:white; background:var(--status-danger,#da373c); }
+        .mle-entry-edited { border-left-color:#f0b232 !important; }
+        .mle-edited-pill { border-color:rgba(240,178,50,.55) !important; color:#ffd166 !important; }
+        .mle-edit-history { display:grid; grid-template-columns:minmax(0,1fr) 30px minmax(0,1fr); gap:10px; align-items:stretch; margin-top:10px; }
+        .mle-edit-version { padding:10px 12px; border-radius:6px; background:#191b20; border:1px solid rgba(255,255,255,.10); }
+        .mle-edit-version > span { display:block; margin-bottom:5px; color:#b5bac1; font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.5px; }
+        .mle-edit-version > div { color:#ff9da0; white-space:pre-wrap; overflow-wrap:anywhere; }
+        .mle-edit-after > div { color:#9ee6a5; }
+        .mle-edit-arrow { display:grid; place-items:center; color:#f0b232; font-size:21px; font-weight:800; }
         .mle-empty { height:100%; display:grid; place-items:center; color:var(--text-muted); font-size:16px; }
         .mle-footer {
             min-height:88px;
@@ -993,7 +1350,7 @@ function openLogDialog() {
             .mle-controls { align-items:stretch; flex-direction:column; padding:16px 20px; }
             .mle-search-wrap { width:auto; }
             .mle-filter-controls { align-items:stretch; flex-direction:column; }
-            .mle-sort,.mle-content-filter { width:100%; }
+            .mle-sort,.mle-content-filter,.mle-log-type { width:100%; }
             .mle-list { padding:0 20px 20px; }
             .mle-entry { grid-template-columns:44px minmax(0,1fr); }
             .mle-avatar { width:44px; height:44px; }
@@ -1008,7 +1365,7 @@ function openLogDialog() {
                 <svg class="mle-brand-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M9 3V2h6v1h5v2H4V3h5Zm-3 4h12l-1 14H7L6 7Zm3 2 .5 10h1L10 9H9Zm4 0v10h1V9h-1Z"/></svg>
                 <div>
                     <h2 class="mle-title">MessageLoggerEnhanced</h2>
-                    <div class="mle-subtitle">Deleted Message Log</div>
+                    <div class="mle-subtitle">Deleted & Edited Message Logs</div>
                     <div class="mle-count"></div>
                 </div>
             </div>
@@ -1032,13 +1389,42 @@ function openLogDialog() {
                 <button class="mle-current-server-toggle" type="button"></button>
             </div>
         </section>
+        <section class="mle-extra-tools">
+            <button class="mle-pause mle-tool">Pause logging</button>
+            <label><input type="checkbox" class="mle-bookmarks-only"> Bookmarks only</label>
+            <label><input type="checkbox" class="mle-ghosts-only"> Ghost pings only</label>
+            <label><input type="checkbox" class="mle-media-enabled"> Cache images/GIFs locally</label>
+            <label>Media limit MB <input type="number" class="mle-media-limit" min="1" max="2048" value="100" style="width:66px"></label>
+            <label>Ignore user IDs <input type="text" class="mle-ignored-users" placeholder="Comma-separated user IDs"></label>
+            <button class="mle-backup mle-tool">Backup JSON</button>
+            <button class="mle-restore mle-tool">Restore backup</button>
+            <input type="file" class="mle-import-file" accept=".json,application/json" style="display:none">
+            <span class="mle-storage-info"></span>
+        </section>
+        <section class="mle-advanced-search">
+            <input class="mle-filter-author" placeholder="Filter user / user ID">
+            <input class="mle-filter-channel" placeholder="Filter channel / server ID">
+            <label>From <input class="mle-filter-since" type="date"></label>
+            <label>To <input class="mle-filter-until" type="date"></label>
+            <button class="mle-reset-filters mle-tool">Reset filters</button>
+        </section>
         <section class="mle-controls">
+            <label class="mle-badge-toggle" style="display:flex;align-items:center;gap:8px;color:#e7e9ee;font-size:13px;white-space:nowrap">
+                <input type="checkbox" class="mle-badge-setting" ${settings.store.showUnreadBadge ? "checked" : ""}>
+                Notification badge
+            </label>
             <label class="mle-search-wrap">
                 <svg class="mle-search-icon" viewBox="0 0 24 24"><path fill="currentColor" d="m20.7 19.3-4.2-4.2a7 7 0 1 0-1.4 1.4l4.2 4.2 1.4-1.4ZM5 11a6 6 0 1 1 12 0 6 6 0 0 1-12 0Z"/></svg>
-                <input class="mle-search" type="search" placeholder="Search messages..." autocomplete="off">
+                <input class="mle-search" type="search" placeholder="Search text, user, channel, ID..." autocomplete="off" spellcheck="false">
+                <button class="mle-search-clear" type="button" aria-label="Clear search" title="Clear search">×</button>
             </label>
             <div class="mle-filter-controls">
-                <select class="mle-content-filter" aria-label="Filter deleted content">
+                <select class="mle-log-type" aria-label="Choose log type">
+                    <option value="all">Deleted and edited</option>
+                    <option value="deleted">Deleted messages only</option>
+                    <option value="edited">Edited messages only</option>
+                </select>
+                <select class="mle-content-filter" aria-label="Filter message content">
                     <option value="all">All deleted content</option>
                     <option value="text">Text messages only</option>
                     <option value="images">Images only</option>
@@ -1063,6 +1449,42 @@ function openLogDialog() {
 
     document.body.appendChild(dialog);
     logDialog = dialog;
+    const wireInput = (selector: string, setter: (v: string) => void) => {
+        const input = dialog.querySelector<HTMLInputElement>(selector);
+        input?.addEventListener("input", () => { setter(input.value); dialogPage = 1; renderLogDialog(); });
+    };
+    wireInput(".mle-filter-author", v => filterAuthor = v);
+    wireInput(".mle-filter-channel", v => filterChannel = v);
+    wireInput(".mle-filter-since", v => filterSince = v);
+    wireInput(".mle-filter-until", v => filterUntil = v);
+    const bookmarked = dialog.querySelector<HTMLInputElement>(".mle-bookmarks-only");
+    bookmarked?.addEventListener("change", () => { bookmarksOnly = bookmarked.checked; dialogPage = 1; renderLogDialog(); });
+    const ghosts = dialog.querySelector<HTMLInputElement>(".mle-ghosts-only");
+    ghosts?.addEventListener("change", () => { ghostsOnly = ghosts.checked; dialogPage = 1; renderLogDialog(); });
+    const media = dialog.querySelector<HTMLInputElement>(".mle-media-enabled");
+    if (media) { media.checked = mediaCacheEnabled; media.addEventListener("change", () => { mediaCacheEnabled = media.checked; saveExtraState(); }); }
+    const limit = dialog.querySelector<HTMLInputElement>(".mle-media-limit");
+    if (limit) { limit.value = String(mediaLimitMb); limit.addEventListener("change", () => { mediaLimitMb = Math.max(1, Math.min(2048, Number(limit.value) || 100)); saveExtraState(); void pruneMedia(); }); }
+    const ignored = dialog.querySelector<HTMLInputElement>(".mle-ignored-users");
+    if (ignored) { ignored.value = ignoredUsers; ignored.addEventListener("change", () => { ignoredUsers = ignored.value; saveExtraState(); }); }
+    dialog.querySelector(".mle-pause")?.addEventListener("click", () => { paused = !paused; saveExtraState(); updatePanelState(); });
+    dialog.querySelector(".mle-backup")?.addEventListener("click", makeBackup);
+    const fileInput = dialog.querySelector<HTMLInputElement>(".mle-import-file");
+    dialog.querySelector(".mle-restore")?.addEventListener("click", () => fileInput?.click());
+    fileInput?.addEventListener("change", async () => {
+        if (!fileInput.files?.[0]) return;
+        try { await importBackup(fileInput.files[0]); alert("Backup restored. Existing logs were merged without duplicate keys."); }
+        catch (error) { alert(`Backup import failed: ${String(error)}`); }
+        fileInput.value = "";
+    });
+    dialog.querySelector(".mle-reset-filters")?.addEventListener("click", () => {
+        filterAuthor = filterChannel = filterSince = filterUntil = "";
+        for (const selector of [".mle-filter-author", ".mle-filter-channel", ".mle-filter-since", ".mle-filter-until"]) {
+            const item = dialog.querySelector<HTMLInputElement>(selector); if (item) item.value = "";
+        }
+        dialogPage = 1; renderLogDialog();
+    });
+    updatePanelState();
 
     dialog.querySelector(".mle-close")?.addEventListener("click", closeLogDialog);
     const modeSelect = dialog.querySelector<HTMLSelectElement>(".mle-tracking-mode");
@@ -1110,15 +1532,68 @@ function openLogDialog() {
     });
     updateCurrentServerButton();
     dialog.querySelector(".mle-download")?.addEventListener("click", () =>
-        downloadJsonFile(logs.filter(log => log.type === "deleted")));
+        downloadJsonFile(getVisibleLogs()));
     dialog.querySelector(".mle-clear")?.addEventListener("click", () => {
-        if (confirm("Delete every saved deleted-message log? This cannot be undone."))
-            clearDeletedLogs();
+        const label = dialogLogType === "deleted" ? "deleted-message" : dialogLogType === "edited" ? "edited-message" : "message";
+        if (confirm(`Delete every saved ${label} log in this view? This cannot be undone.`))
+            clearVisibleLogType();
+    });
+
+    dialog.querySelector<HTMLInputElement>(".mle-badge-setting")?.addEventListener("change", event => {
+        settings.store.showUnreadBadge = (event.currentTarget as HTMLInputElement).checked;
+        updateToolbarBadge();
     });
 
     const search = dialog.querySelector<HTMLInputElement>(".mle-search");
+    const clearSearch = dialog.querySelector<HTMLButtonElement>(".mle-search-clear");
+    let searchTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const updateClearSearchButton = () =>
+        clearSearch?.classList.toggle("mle-visible", Boolean(search?.value));
+
     search?.addEventListener("input", () => {
-        dialogSearch = search.value;
+        updateClearSearchButton();
+        if (searchTimer)
+            clearTimeout(searchTimer);
+
+        searchTimer = setTimeout(() => {
+            dialogSearch = search.value;
+            dialogPage = 1;
+            renderLogDialog();
+
+            // Rendering only replaces the result list, but explicitly restore
+            // focus and cursor position for custom Discord themes/plugins.
+            search.focus();
+            search.setSelectionRange(search.value.length, search.value.length);
+        }, 90);
+    });
+
+    search?.addEventListener("keydown", event => {
+        if (event.key === "Escape" && search.value) {
+            event.preventDefault();
+            search.value = "";
+            dialogSearch = "";
+            dialogPage = 1;
+            updateClearSearchButton();
+            renderLogDialog();
+        }
+    });
+
+    clearSearch?.addEventListener("click", () => {
+        if (!search) return;
+        search.value = "";
+        dialogSearch = "";
+        dialogPage = 1;
+        updateClearSearchButton();
+        renderLogDialog();
+        search.focus();
+    });
+    updateClearSearchButton();
+
+    const logType = dialog.querySelector<HTMLSelectElement>(".mle-log-type");
+    logType?.addEventListener("change", () => {
+        const value = logType.value;
+        dialogLogType = value === "deleted" || value === "edited" ? value : "all";
         dialogPage = 1;
         renderLogDialog();
     });
@@ -1167,7 +1642,9 @@ function openLogDialog() {
 }
 function updateToolbarBadge() {
     if (!toolbarButton) return;
-    const count = logs.filter(log => log.type === "deleted").length;
+    const count = settings.store.showUnreadBadge
+        ? logs.filter(log => Date.parse(log.loggedAt) > lastViewedAt).length
+        : 0;
     toolbarButton.dataset.count = String(count);
     toolbarButton.title = `MessageLoggerEnhanced (${count})`;
     toolbarButton.setAttribute("aria-label", `MessageLoggerEnhanced (${count})`);
@@ -1450,6 +1927,19 @@ function addGlobalChatStyles() {
         .mle-retained-deleted-message.mle-jump-highlight {
             animation:mleJumpPulse 1.1s ease-in-out 2;
         }
+        .mle-live-edited-message { position:relative; }
+        .mle-live-edited-message::after {
+            content:attr(data-mle-edited);
+            display:inline-block;
+            margin-left:7px;
+            padding:1px 6px;
+            border-radius:4px;
+            color:#1e1f22;
+            background:#f0b232;
+            font-size:10px;
+            font-weight:800;
+            vertical-align:middle;
+        }
         .mle-chat-attachments a,.mle-chat-attachments span {
             padding:5px 8px;
             border-radius:5px;
@@ -1469,26 +1959,28 @@ function shouldIgnore(message: { author?: StoredAuthor | any; } | undefined): bo
 }
 
 function handleCreate(event: { message?: any; optimistic?: boolean; }) {
-    if (!event.message || event.optimistic) return;
-    rememberMessage(event.message);
+    if (paused || !event.message || event.optimistic) return;
+    const item = rememberMessage(event.message);
+    if (item && !ignoredAuthor(item.author)) void cacheMedia(item.attachments);
 }
 
 function handleDelete(event: { channelId: string; id: string; }) {
     const channelId = String(event.channelId ?? "");
     const messageId = String(event.id ?? "");
-    if (!channelId || !messageId) return;
+    if (paused || !channelId || !messageId) return;
 
     const originalElement = document.getElementById(`chat-messages-${channelId}-${messageId}`)
         ?? document.querySelector(`[data-list-item-id*="${channelId}-${messageId}"]`);
 
     const message = removeCachedMessage(channelId, messageId);
-    if (!message || shouldIgnore(message) || !shouldTrackLocation(channelId, message.guildId)) return;
+    if (!message || shouldIgnore(message) || ignoredAuthor(message.author) || !shouldTrackLocation(channelId, message.guildId)) return;
 
     retainDeletedMessageInChat(message, originalElement);
 
     addLog({
         key: `deleted:${channelId}:${messageId}`,
         type: "deleted",
+        ghostPing: isGhostPing(message),
         messageId,
         channelId,
         guildId: message.guildId,
@@ -1509,7 +2001,7 @@ function handleUpdate(event: { message?: any; }) {
     const incoming = event.message;
     const channelId = String(incoming?.channel_id ?? incoming?.channelId ?? "");
     const messageId = String(incoming?.id ?? "");
-    if (!channelId || !messageId) return;
+    if (paused || !channelId || !messageId) return;
 
     const channel: any = ChannelStore.getChannel(channelId);
     if (!shouldTrackLocation(channelId, channel?.guild_id))
@@ -1523,6 +2015,7 @@ function handleUpdate(event: { message?: any; }) {
     messageCache[key] = updated;
     trimMessageCache();
     scheduleCacheSave();
+    void cacheMedia(updated.attachments);
 
     // Discord can emit partial MESSAGE_UPDATE events that do not contain content.
     // Only create an edit log when we know both the old and new text.
@@ -1530,7 +2023,7 @@ function handleUpdate(event: { message?: any; }) {
 
     const oldContent = previous.content;
     const newContent = String(incoming.content);
-    if (oldContent === newContent || shouldIgnore(updated)) return;
+    if (oldContent === newContent || shouldIgnore(updated) || ignoredAuthor(updated.author)) return;
 
     const editTimestamp = incoming.edited_timestamp
         ? String(incoming.edited_timestamp)
@@ -1550,6 +2043,16 @@ function handleUpdate(event: { message?: any; }) {
         messageTimestamp: updated.messageTimestamp,
         loggedAt: editTimestamp
     });
+
+    // Add a visible marker to the live message without replacing Discord's message rendering.
+    setTimeout(() => {
+        if (SelectedChannelStore.getChannelId() !== channelId) return;
+        const element = document.getElementById(`chat-messages-${channelId}-${messageId}`)
+            ?? document.querySelector<HTMLElement>(`[data-list-item-id*="${channelId}-${messageId}"]`);
+        if (!element) return;
+        element.classList.add("mle-live-edited-message");
+        element.setAttribute("data-mle-edited", "Edited");
+    }, 80);
 }
 
 
@@ -1590,6 +2093,12 @@ const patchChannelContextMenu: NavContextMenuPatchCallback = (children, { channe
 };
 
 const settings = definePluginSettings({
+    showUnreadBadge: {
+        type: OptionType.BOOLEAN,
+        description: "Show the red notification number for new deleted or edited messages until the panel is opened",
+        default: true,
+        onChange: () => updateToolbarBadge()
+    },
     maximumLogs: {
         type: OptionType.NUMBER,
         description: "Maximum number of logs stored permanently",
@@ -1724,12 +2233,21 @@ export default definePlugin({
     async start() {
         addGlobalChatStyles();
 
-        const [storedLogs, storedCache, legacyLogs, legacyCache] = await Promise.all([
+        const [storedLogs, storedCache, legacyLogs, legacyCache, storedLastViewed] = await Promise.all([
             DataStore.get<PersistentLog[]>(STORE_KEY),
             DataStore.get<Record<string, CachedMessage>>(CACHE_KEY),
             DataStore.get<PersistentLog[]>(LEGACY_STORE_KEY),
-            DataStore.get<Record<string, CachedMessage>>(LEGACY_CACHE_KEY)
+            DataStore.get<Record<string, CachedMessage>>(LEGACY_CACHE_KEY),
+            DataStore.get<number>(READ_KEY)
         ]);
+        const savedExtra = await DataStore.get<{paused?: boolean; ignoredUsers?: string; mediaCacheEnabled?: boolean; mediaLimitMb?: number}>(EXTRA_KEY);
+        paused = !!savedExtra?.paused;
+        ignoredUsers = String(savedExtra?.ignoredUsers ?? "");
+        mediaCacheEnabled = !!savedExtra?.mediaCacheEnabled;
+        mediaLimitMb = Math.max(1, Number(savedExtra?.mediaLimitMb) || 100);
+        void refreshMediaSize();
+        lastViewedAt = typeof storedLastViewed === "number" ? storedLastViewed : Date.now();
+        if (typeof storedLastViewed !== "number") void DataStore.set(READ_KEY, lastViewedAt);
 
         logs = Array.isArray(storedLogs)
             ? storedLogs
